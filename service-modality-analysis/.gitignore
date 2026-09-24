@@ -1,0 +1,8 @@
+data/*.rds
+data/*.csv
+output/*.html
+output/*.xlsx
+analysis/*.knit.md
+.Rhistory
+.RData
+.Rproj.user

@@ -1,0 +1,471 @@
+---
+title: "Store Service-Channel Modality & Experience Outcomes"
+author: "Jensen Hu"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile,
+                    encoding = encoding,
+                    output_dir  = here::here("output"),
+                    output_file = "store-modality-analysis.html")})
+output:
+  html_document:
+    toc: true
+---
+
+**Disclaimer:** This notebook is a synthetic, portfolio demonstration. All
+organizations, identifiers, and data below are fictional or randomly
+generated. It does not represent any real employer, client, or dataset, and
+none of the numbers should be treated as meaningful.
+
+It demonstrates a handful of techniques from applied survey/administrative
+data analysis: imputing a low-response rater group from a higher-response
+one, reshaping a long panel into a wide one keyed on two comparison periods,
+a checked join that surfaces unmatched keys, and looping a robust-SE
+regression across many outcomes at both the unit level and a group-aggregated
+level, with results written out to a multi-sheet workbook.
+
+```{r setup, message = FALSE}
+### Setup ---------------------------------------------------------------------#
+rm(list = ls())
+set.seed(20240115)
+
+options(dplyr.print_max = 100)
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(glue)
+library(haven)
+library(assertr)
+library(estimatr)
+library(openxlsx)
+library(knitr)
+library(here)
+
+data_dir <- here("data")
+out_dir  <- here("output")
+
+source(here("R", "generate_synthetic_data.R"))
+source(here("R", "utils.R"))
+```
+
+## Read in Analytic File
+
+```{r}
+synthetic <- generate_store_panel()
+df       <- synthetic$store_panel
+survey_completion <- synthetic$survey_completion
+```
+
+## Clean data
+
+```{r}
+vars <- c(
+  "store_id",
+  "store_name",
+  "region_id",
+  "region_name",
+  "resp_cust_survey",
+  "resp_emp_survey",
+  "svc_instore_prop",
+  "svc_curbside_prop",
+  "svc_delivery_prop",
+  "fiscal_year",
+  "market_type",
+  "store_size_tier",
+  "total_customers",
+  "pct_seg_young_adult",
+  "pct_seg_family",
+  "pct_seg_senior",
+  "pct_seg_business",
+  "pct_seg_student",
+  "pct_seg_other",
+  "discount_zone_flag",
+  "emp_fte",
+  "emp_customer_ratio",
+  "total_customers_loyalty",
+  "numvalid_ops",
+  "numvalid_svc",
+  "pct_target_ops",
+  "pct_target_svc",
+  "idx_overall_cust",
+  "idx_loyalty_cust",
+  "idx_service_cust",
+  "idx_culture_cust",
+  "idx_overall_emp",
+  "idx_loyalty_emp",
+  "idx_service_emp",
+  "idx_culture_emp",
+  "idx_overall_mgr",
+  "idx_loyalty_mgr",
+  "idx_service_mgr",
+  "idx_culture_mgr",
+  "include_analysis"
+)
+
+df$fiscal_year <- haven::zap_label(df$fiscal_year)
+
+list_index <-
+  list(
+    c("idx_overall_mgr", "idx_overall_emp"),
+    c("idx_loyalty_mgr", "idx_loyalty_emp"),
+    c("idx_service_mgr", "idx_service_emp"),
+    c("idx_culture_mgr", "idx_culture_emp")
+  )
+
+# impute manager-reported score with the employee score when missing
+for (pair in list_index) {
+
+  print(pair)
+
+  x <- pair[1]
+  y <- pair[2]
+
+  print(paste("number missing before = ", length(df[[x]][is.na(df[[x]])])))
+
+  df[[x]][is.na(df[[x]])] <- df[[y]][is.na(df[[x]])]
+  assign("df_imputed", df)
+
+  print(paste("number missing after = ", length(df[[x]][is.na(df[[x]])])))
+}
+
+
+store_wide <- df_imputed %>%
+  # restrict to stores eligible for this analysis
+  filter(include_analysis == 1) %>%
+  mutate(
+    fiscal_year = factor(fiscal_year, ordered = TRUE,
+                          levels = c("1", "2", "3", "4", "5", "6")),
+    region_id = substring(store_id, 1, 4)
+  ) %>%
+  # nonmissing service-channel data
+  filter(
+    !is.na(svc_instore_prop) |
+      !is.na(svc_curbside_prop) |
+      !is.na(svc_delivery_prop)
+  ) %>%
+  # restrict to baseline (FY19) and follow-up (FY22) periods
+  filter(fiscal_year %in% c(3, 6)) %>%
+  mutate(
+    fiscal_year = case_when(
+      fiscal_year == 3 ~ "fy19",
+      fiscal_year == 6 ~ "fy22"
+    )
+  ) %>%
+  select(all_of(vars)) %>%
+  pivot_wider(
+    id_cols = vars[1:9],
+    names_from = fiscal_year,
+    values_from = vars[11:length(vars)]
+  )
+
+# switch between employee (1) vs manager (0) score version
+toggle_role <- 1
+
+
+saveRDS(store_wide, file.path(data_dir, "store_modality_wide.rds"))
+
+knitr::kable(head(store_wide))
+```
+
+
+## Count of Stores w/ Survey Response
+
+```{r}
+
+store_wide %>%
+  filter(resp_emp_survey == 1 | resp_cust_survey == 1) %>%
+  checked_join(
+    survey_completion,
+    by = c("region_id" = "csat_region_key"),
+    tab = TRUE
+  ) %>%
+  mutate(resp_cust_survey = as.character(resp_cust_survey),
+         resp_emp_survey  = as.character(resp_emp_survey)) %>%
+  group_by(merge, resp_cust_survey, resp_emp_survey) %>%
+  tally()
+
+```
+
+
+## Table: Service-Channel Mix
+### Service-Channel Mix - Employee-surveyed stores
+```{r}
+# analysis
+analysis <- store_wide %>%
+  mutate(
+    # market-type construct
+    urban_fy19    = as.numeric(market_type_fy19 == 1),
+    suburban_fy19 = as.numeric(market_type_fy19 == 2),
+    town_fy19     = as.numeric(market_type_fy19 == 3),
+    rural_fy19    = as.numeric(market_type_fy19 == 4)
+  )
+
+# subset data
+employee_data <- analysis %>% filter(resp_emp_survey == 1)
+customer_data <- analysis %>% filter(resp_cust_survey == 1)
+
+# Table: Service-Channel Mix
+modality_emp <-
+  employee_data %>%
+  select(
+    store_id,
+    svc_curbside_prop,
+    svc_instore_prop,
+    svc_delivery_prop
+  ) %>%
+  arrange(desc(svc_curbside_prop)) %>%
+  verify(abs(svc_curbside_prop + svc_instore_prop + svc_delivery_prop - 100) < 1e-6) %>%
+  mutate_if(is.numeric, ~round(.x, 2)) %>%
+  rename(
+    "Store ID"     = store_id,
+    "% Curbside"   = svc_curbside_prop,
+    "% In-Store"   = svc_instore_prop,
+    "% Delivery"   = svc_delivery_prop
+  )
+knitr::kable(modality_emp)
+```
+
+### Service-Channel Mix - Customer-surveyed stores
+```{r}
+modality_cust <-
+  customer_data %>%
+  select(
+    store_id,
+    svc_curbside_prop,
+    svc_instore_prop,
+    svc_delivery_prop
+  ) %>%
+  arrange(desc(svc_curbside_prop)) %>%
+  verify(abs(svc_curbside_prop + svc_instore_prop + svc_delivery_prop - 100) < 1e-6) %>%
+  mutate_if(is.numeric, ~round(.x, 2)) %>%
+  rename(
+    "Store ID"     = store_id,
+    "% Curbside"   = svc_curbside_prop,
+    "% In-Store"   = svc_instore_prop,
+    "% Delivery"   = svc_delivery_prop
+  )
+knitr::kable(modality_cust)
+```
+
+
+## Regression
+```{r}
+
+if (toggle_role == 1) {
+  # employee - version
+  dv <- c(
+    "idx_overall_cust_fy22",
+    "idx_loyalty_cust_fy22",
+    "idx_service_cust_fy22",
+    "idx_culture_cust_fy22",
+    "idx_overall_emp_fy22",
+    "idx_loyalty_emp_fy22",
+    "idx_service_emp_fy22",
+    "idx_culture_emp_fy22"
+  )
+
+  sc_fy19 <- c(
+    "idx_overall_cust_fy19",
+    "idx_loyalty_cust_fy19",
+    "idx_service_cust_fy19",
+    "idx_culture_cust_fy19",
+    "idx_overall_emp_fy19",
+    "idx_loyalty_emp_fy19",
+    "idx_service_emp_fy19",
+    "idx_culture_emp_fy19"
+  )
+} else {
+  # manager - version
+  dv <- c(
+    "idx_overall_cust_fy22",
+    "idx_loyalty_cust_fy22",
+    "idx_service_cust_fy22",
+    "idx_culture_cust_fy22",
+    "idx_overall_mgr_fy22",
+    "idx_loyalty_mgr_fy22",
+    "idx_service_mgr_fy22",
+    "idx_culture_mgr_fy22"
+  )
+
+  sc_fy19 <- c(
+    "idx_overall_cust_fy19",
+    "idx_loyalty_cust_fy19",
+    "idx_service_cust_fy19",
+    "idx_culture_cust_fy19",
+    "idx_overall_mgr_fy19",
+    "idx_loyalty_mgr_fy19",
+    "idx_service_mgr_fy19",
+    "idx_culture_mgr_fy19"
+  )
+}
+
+
+svc_list <- c(
+  "svc_curbside_prop",
+  "svc_delivery_prop",
+  "svc_instore_prop",
+  "svc_curbside_prop + svc_delivery_prop"
+)
+
+regression <- function(x, y, z) {
+
+  if (x %in% c(1, 2, 3, 4)) {
+    print(paste(dv[x], "~", svc_list[y], "+", sc_fy19[x]))
+    fit <- estimatr::lm_robust(as.formula(paste(dv[x], "~", svc_list[y], "+", sc_fy19[x])), data = customer_data)
+  } else {
+    print(paste(dv[x], "~", svc_list[y], "+", sc_fy19[x]))
+    fit <- estimatr::lm_robust(as.formula(paste(dv[x], "~", svc_list[y], "+", sc_fy19[x])), data = employee_data)
+  }
+  print(summary(fit))
+
+  out <- data.frame(
+    "dv"          = dv[x],
+    "Coefficient" = fit$coefficients[z],
+    "SE"          = fit$std.error[z],
+    "p-value"     = fit$p.value[z],
+    "CI Lower"    = fit$conf.low[z],
+    "CI Upper"    = fit$conf.high[z]
+  )
+
+  out$svc_var <- row.names(out)
+  out$"p<.05" <- ifelse(out$p.value < .05, "*", "")
+
+  out <- out %>%
+    mutate(across(Coefficient:CI.Upper, ~round(.x, 2))) %>%
+    relocate(svc_var, .before = dv)
+
+  return(out)
+}
+
+regression_agg <- function(x, y, svc_var) {
+
+  # prepare data
+  data <-
+    (if (x %in% c(1, 2, 3, 4)) {
+      customer_data
+    } else {
+      employee_data
+    }) %>%
+    # mean of scores by region_id
+    group_by(region_id) %>%
+    mutate(
+      "{dv[x]}_agg"      := mean(.data[[glue("{dv[x]}")]], na.rm = TRUE),
+      "{sc_fy19[x]}_agg" := mean(.data[[glue("{sc_fy19[x]}")]], na.rm = TRUE)
+    ) %>%
+    select(
+      region_id,
+      glue("{dv[x]}_agg"),
+      glue("{sc_fy19[x]}_agg"),
+      all_of(svc_var)
+    ) %>%
+    # distinct by region_id
+    unique()
+
+  # run regression
+  print(paste(glue("{dv[x]}_agg"), "~", svc_list[y], "+", glue("{sc_fy19[x]}_agg")))
+  fit <- estimatr::lm_robust(as.formula(paste(glue("{dv[x]}_agg"), "~", svc_list[y], "+", glue("{sc_fy19[x]}_agg"))), data = data)
+
+  print(summary(fit))
+
+  # structure output
+  out <- data.frame(
+    "dv"          = rep(glue("{dv[x]}_agg"), length(svc_var)),
+    "Coefficient" = fit$coefficients[svc_var],
+    "SE"          = fit$std.error[svc_var],
+    "p-value"     = fit$p.value[svc_var],
+    "CI Lower"    = fit$conf.low[svc_var],
+    "CI Upper"    = fit$conf.high[svc_var]
+  )
+  out$svc <- row.names(out)
+  out$"p<.05" <- ifelse(out$p.value < .05, "*", "")
+  out <- out %>%
+    mutate(across(Coefficient:CI.Upper, ~round(.x, 2))) %>%
+    relocate(svc, .before = dv)
+
+  return(out)
+}
+
+```
+
+### Model 1: svc_curbside_prop
+```{r}
+model1 <- map_dfr(c(1:length(dv)), function(x) regression(x, y = 1, z = "svc_curbside_prop"))
+knitr::kable(model1)
+```
+
+### Model 1: svc_curbside_prop - region level
+```{r}
+model1_agg <- map_dfr(c(1:length(dv)), function(x) regression_agg(x, y = 1, svc_var = "svc_curbside_prop"))
+knitr::kable(model1_agg)
+```
+
+### Model 2: svc_delivery_prop
+```{r}
+model2 <- map_dfr(c(1:length(dv)), function(x) regression(x, y = 2, z = "svc_delivery_prop"))
+knitr::kable(model2)
+```
+
+### Model 2: svc_delivery_prop - region level
+```{r}
+model2_agg <- map_dfr(c(1:length(dv)), function(x) regression_agg(x, y = 2, svc_var = "svc_delivery_prop"))
+knitr::kable(model2_agg)
+```
+
+### Model 3: svc_instore_prop
+```{r}
+model3 <- map_dfr(c(1:length(dv)), function(x) regression(x, y = 3, z = "svc_instore_prop"))
+knitr::kable(model3)
+```
+
+### Model 3: svc_instore_prop - region level
+```{r}
+model3_agg <- map_dfr(c(1:length(dv)), function(x) regression_agg(x, y = 3, svc_var = "svc_instore_prop"))
+knitr::kable(model3_agg)
+```
+
+### Model 4: svc_curbside_prop + svc_delivery_prop
+```{r}
+model4 <- map_dfr(c(1:length(dv)), function(x) regression(x, y = 4, z = 2:3)) %>% arrange(svc_var)
+knitr::kable(model4)
+```
+
+### Model 4: svc_curbside_prop + svc_delivery_prop - region level
+```{r}
+model4_agg <- map_dfr(c(1:length(dv)), function(x) regression_agg(x, y = 4, svc_var = c("svc_curbside_prop", "svc_delivery_prop"))) %>% arrange(svc)
+knitr::kable(model4_agg)
+```
+
+
+## Output
+```{r, eval = TRUE}
+
+# output ####
+wb <- createWorkbook()
+
+addWorksheet(wb, "Modality EMP")
+freezePane(  wb, "Modality EMP", firstRow = TRUE)
+writeData(   wb, "Modality EMP",  modality_emp, headerStyle = createStyle(textDecoration = "bold"))
+addWorksheet(wb, "Modality CUST")
+writeData(   wb, "Modality CUST",  modality_cust, headerStyle = createStyle(textDecoration = "bold"))
+
+addWorksheet(wb, "Model1")
+writeData(   wb, "Model1",  model1, headerStyle = createStyle(textDecoration = "bold"))
+addWorksheet(wb, "Model1 region level")
+writeData(   wb, "Model1 region level",  model1_agg, headerStyle = createStyle(textDecoration = "bold"))
+addWorksheet(wb, "Model2")
+writeData(   wb, "Model2",  model2, headerStyle = createStyle(textDecoration = "bold"))
+addWorksheet(wb, "Model2 region level")
+writeData(   wb, "Model2 region level",  model2_agg, headerStyle = createStyle(textDecoration = "bold"))
+addWorksheet(wb, "Model3")
+writeData(   wb, "Model3",  model3, headerStyle = createStyle(textDecoration = "bold"))
+addWorksheet(wb, "Model3 region level")
+writeData(   wb, "Model3 region level",  model3_agg, headerStyle = createStyle(textDecoration = "bold"))
+addWorksheet(wb, "Model4")
+writeData(   wb, "Model4",  model4, headerStyle = createStyle(textDecoration = "bold"))
+addWorksheet(wb, "Model4 region level")
+writeData(   wb, "Model4 region level",  model4_agg, headerStyle = createStyle(textDecoration = "bold"))
+
+saveWorkbook(wb, file.path(out_dir, "store-svc-modality-results.xlsx"), overwrite = TRUE)
+
+```
