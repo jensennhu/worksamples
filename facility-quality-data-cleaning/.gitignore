@@ -1,0 +1,7 @@
+data/raw/facility_directory/*.csv
+data/raw/quality_reporting/*.csv
+data/raw/quality_reporting/StateQualityRegistry_RY2021-2022/*.xlsx
+data/intermediate/*.RDS
+.Rhistory
+.RData
+.Rproj.user

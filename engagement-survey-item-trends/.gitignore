@@ -1,0 +1,6 @@
+data/*.rds
+output/*
+!output/.gitkeep
+.Rhistory
+.RData
+.Rproj.user
